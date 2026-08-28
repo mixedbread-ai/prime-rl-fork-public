@@ -767,6 +767,55 @@ class MultiLoRANonGatedGroupedExperts(MultiLoRAModule):
         )
 
 
+class MultiLoRAFusedGateUpGroupedExperts(MultiLoRAGroupedExperts):
+    target_parameters = ("mlp.experts.gate_up_proj", "mlp.experts.down_proj")
+
+    def __init__(
+        self,
+        base_layer: GroupedExperts,
+        rank: int,
+        n_adapters: int,
+        alpha: float = 32.0,
+        dropout: float = 0.0,
+        use_grouped_mm: bool = True,
+    ):
+        super().__init__(base_layer, rank, n_adapters, alpha, dropout, use_grouped_mm)
+        self.w3_lora_A = self.w1_lora_A
+
+    def named_parameters_for_adapter(self, idx: int) -> list[tuple[str, nn.Parameter]]:
+        return [
+            ("w1_lora_A", self.w1_lora_A[idx]),
+            ("w1_lora_B", self.w1_lora_B[idx]),
+            ("w2_lora_A", self.w2_lora_A[idx]),
+            ("w2_lora_B", self.w2_lora_B[idx]),
+            ("w3_lora_B", self.w3_lora_B[idx]),
+        ]
+
+    def get_lora_param_counts(self) -> tuple[int, int]:
+        adapter_params = sum(param.numel() for _, param in self.named_parameters_for_adapter(0))
+        adapted_params = self.base_layer.w1.numel() + self.base_layer.w2.numel() + self.base_layer.w3.numel()
+        return adapter_params, adapted_params
+
+    def state_dict_for_adapter(self, idx: int) -> dict[str, torch.Tensor]:
+        gate_up_a = self.w1_lora_A[idx].detach()
+        gate_up_b = torch.cat((self.w1_lora_B[idx], self.w3_lora_B[idx]), dim=1).detach()
+        down_a = self.w2_lora_A[idx].detach()
+        down_b = self.w2_lora_B[idx].detach()
+
+        if isinstance(gate_up_a, DTensor):
+            gate_up_a = gate_up_a.full_tensor()
+            gate_up_b = gate_up_b.full_tensor()
+            down_a = down_a.full_tensor()
+            down_b = down_b.full_tensor()
+
+        return {
+            "base_layer.lora_A.weight": gate_up_a.flatten(0, 1).clone(),
+            "base_layer.lora_B.weight": gate_up_b.permute(1, 2, 0).flatten(1, 2).clone(),
+            "lora_A.weight": down_a.flatten(0, 1).clone(),
+            "lora_B.weight": down_b.permute(1, 2, 0).flatten(1, 2).clone(),
+        }
+
+
 class MultiLoRAGptOssGroupedExperts(MultiLoRAModule):
     """
     GptOssGroupedExperts + multi-LoRA.

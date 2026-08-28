@@ -168,6 +168,17 @@ def _find_target_modules(model: nn.Module, target_patterns: List[str]) -> List[s
     return target_modules
 
 
+def _target_patterns(model: nn.Module, config: LoRAConfig) -> list[str]:
+    if "target_modules" not in config.model_fields_set:
+        return list(getattr(model, "default_lora_target_modules", config.target_modules))
+    return config.target_modules
+
+
+def _adapter_target_module(model: nn.Module, name: str) -> str:
+    get_target = getattr(model, "lora_adapter_target_module", None)
+    return get_target(name) if callable(get_target) else name.rsplit(".", 1)[-1]
+
+
 def _should_keep_trainable(param_name: str, modules_to_save_patterns: List[str]) -> bool:
     """Check if a parameter should remain fully trainable.
 
@@ -233,14 +244,15 @@ def apply_lora_to_model(model: nn.Module, config: LoRAConfig) -> None:
         )
         raise RuntimeError("Cannot apply LoRA to FSDP-wrapped model. Apply LoRA before setup_fsdp().")
 
-    logger.debug(f"Applying LoRA to {type(model).__name__} (target_modules={config.target_modules})")
-    target_modules = _find_target_modules(model, config.target_modules)
+    target_patterns = _target_patterns(model, config)
+    logger.debug(f"Applying LoRA to {type(model).__name__} (target_modules={target_patterns})")
+    target_modules = _find_target_modules(model, target_patterns)
     logger.debug(
         f"Found {len(target_modules)} target modules for LoRA: {target_modules[:10]} ... {target_modules[-10:]}"
     )
 
     if not target_modules:
-        raise ValueError(f"No LoRA target modules found for patterns {config.target_modules}.")
+        raise ValueError(f"No LoRA target modules found for patterns {target_patterns}.")
 
     for module_name in target_modules:
         base_module = _get_module_by_name(model, module_name)
@@ -256,7 +268,8 @@ def apply_lora_to_model(model: nn.Module, config: LoRAConfig) -> None:
             )
         # Handle GroupedExperts (MoE)
         elif isinstance(base_module, GroupedExperts):
-            lora_module = MultiLoRAGroupedExperts(
+            lora_cls = getattr(model, "lora_grouped_experts_cls", MultiLoRAGroupedExperts)
+            lora_module = lora_cls(
                 base_layer=base_module,
                 rank=config.rank,
                 n_adapters=1,
@@ -338,12 +351,15 @@ def save_lora_config(model: nn.Module, save_path, rank: int, alpha: float, dropo
 
     # Extract actual target modules from the model
     target_modules = set()
+    target_parameters = set()
     modules_to_save = set()
 
     for name, module in model.named_modules():
         if isinstance(module, MultiLoRAModule):
-            module_suffix = name.split(".")[-1]
-            target_modules.add(module_suffix)
+            if hasattr(module, "target_parameters"):
+                target_parameters.update(module.target_parameters)
+            else:
+                target_modules.add(_adapter_target_module(model, name))
 
     for name, param in model.named_parameters():
         if param.requires_grad and "lora_A" not in name and "lora_B" not in name:
@@ -361,6 +377,8 @@ def save_lora_config(model: nn.Module, save_path, rank: int, alpha: float, dropo
         "target_modules": sorted(list(target_modules)),
         "modules_to_save": sorted(list(modules_to_save)) if modules_to_save else None,
     }
+    if target_parameters:
+        adapter_config["target_parameters"] = sorted(target_parameters)
 
     config_path = save_path / "adapter_config.json"
     with open(config_path, "w") as f:

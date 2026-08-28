@@ -11,6 +11,7 @@ def apply_shared_vllm_patches():
     """
     _patch_lora_key_prefix()
     _patch_qwen35_moe_lora_format()
+    _patch_qwen4_exp_moe_lora_format()
     monkey_patch_nano_v3_reasoning_parser()
     monkey_patch_qwen3_coder_param_newline_trim()
     monkey_patch_minimax_m2_think_end_passthrough()
@@ -309,6 +310,23 @@ def _patch_qwen35_moe_lora_format():
     from vllm.model_executor.models.qwen3_5 import Qwen3_5MoeForConditionalGeneration
 
     Qwen3_5MoeForConditionalGeneration.is_3d_moe_weight = False
+
+
+def _patch_qwen4_exp_moe_lora_format():
+    try:
+        from vllm.models.qwen3_8_flash_next import (
+            Qwen3_8FlashNextForCausalLM as Qwen4ExpForCausalLM,
+        )
+        from vllm.models.qwen3_8_flash_next import (
+            Qwen3_8FlashNextForConditionalGeneration as Qwen4ExpForConditionalGeneration,
+        )
+    except ModuleNotFoundError as error:
+        if error.name in {"vllm.models", "vllm.models.qwen3_8_flash_next"}:
+            return
+        raise
+
+    Qwen4ExpForCausalLM.is_3d_moe_weight = True
+    Qwen4ExpForConditionalGeneration.is_3d_moe_weight = True
 
 
 def _patch_lora_key_prefix():
@@ -675,6 +693,8 @@ def monkey_patch_fp32_lm_head():
     Per @Jackmin801 on PR #2438, native ``out_dtype=fp32`` mm is more efficient
     and just as correct.
     """
+    import inspect
+
     import torch
     from vllm.config import get_current_vllm_config
     from vllm.logger import init_logger
@@ -684,6 +704,7 @@ def monkey_patch_fp32_lm_head():
 
     _original_init = LogitsProcessor.__init__
     _original_get_logits = LogitsProcessor._get_logits
+    _original_get_logits_accepts_skip_gather = "skip_gather" in inspect.signature(_original_get_logits).parameters
 
     def _patched_init(self, *args, **kwargs):
         _original_init(self, *args, **kwargs)
@@ -693,8 +714,10 @@ def monkey_patch_fp32_lm_head():
         if self._fp32_lm_head_enabled:
             logger.warning("fp32 lm_head ENABLED for this LogitsProcessor instance.")
 
-    def _patched_get_logits(self, hidden_states, lm_head, embedding_bias):
+    def _patched_get_logits(self, hidden_states, lm_head, embedding_bias, skip_gather=False):
         if not getattr(self, "_fp32_lm_head_enabled", False):
+            if _original_get_logits_accepts_skip_gather:
+                return _original_get_logits(self, hidden_states, lm_head, embedding_bias, skip_gather)
             return _original_get_logits(self, hidden_states, lm_head, embedding_bias)
 
         # Native bf16xbf16 -> fp32 GEMM. torch.mm requires 2D inputs; vLLM v1's
@@ -707,7 +730,10 @@ def monkey_patch_fp32_lm_head():
         if hidden_states.dim() > 2:
             logits = logits.reshape(*hidden_states.shape[:-1], -1)
 
-        logits = self._gather_logits(logits)
+        if skip_gather:
+            return logits
+        if lm_head.tp_size > 1:
+            logits = self._gather_logits(logits)
         if logits is not None:
             logits = logits[..., : self.org_vocab_size]
         return logits

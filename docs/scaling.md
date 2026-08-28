@@ -107,7 +107,7 @@ ep_comm_backend = "torch"  # or "deepep"
 
 ### Context Parallelism
 
-CP shards a single sequence across multiple GPUs along the token dimension — for long-context sequences. We reccomend using `ulysses` style CP for most of the models to get the most throughput. Some models (e.g. GLM-5) only support `ring` style CP. Wrong setting will be rejected on validation.
+CP shards a single sequence across multiple GPUs along the token dimension — for long-context sequences. We reccomend using `ulysses` style CP for most of the models to get the most throughput. Some models (e.g. GLM-5) only support `ring` style CP, and models with linear-attention or Mamba/SSM layers (e.g. Qwen3.5 hybrid, Qwen3.8-Flash-Next, NemotronH) only support `ulysses`. Wrong setting will be rejected on validation.
 
 `ulysses` head-shards Q/K/V, so the CP degree must divide `num_attention_heads`. GQA models with fewer KV heads than the CP degree (e.g. NemotronH: 32 query heads, 2 KV heads) are supported via KV-head replication; the CP degree must then be a multiple of `num_key_value_heads`. Hybrid Mamba layers head-shard independently (`cp_mamba`), which requires the CP degree to divide `mamba_num_heads` and `n_groups`.
 

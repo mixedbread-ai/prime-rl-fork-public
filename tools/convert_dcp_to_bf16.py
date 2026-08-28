@@ -34,6 +34,7 @@ from torch.distributed.checkpoint.state_dict_loader import load as dcp_load
 from prime_rl.configs.trainer import ModelConfig, TokenizerConfig
 from prime_rl.trainer.ckpt import AppState
 from prime_rl.trainer.model import setup_model, setup_processor, setup_tokenizer
+from prime_rl.trainer.models.base import ExternalWeightsModel
 from prime_rl.trainer.parallel_dims import get_parallel_dims, resolve_ep
 from prime_rl.trainer.utils import setup_torch_distributed
 from prime_rl.trainer.world import get_world
@@ -170,6 +171,8 @@ def load_and_convert(ckpt_dir: Path):
         for key in getattr(model, "_tied_weights_keys", []):
             state_dict.pop(key, None)
     state_dict = convert_state_dict_to_hf(model, state_dict)
+    if isinstance(model, ExternalWeightsModel):
+        state_dict.update(model.external_weight_state_dict())
     return model, model_config, tokenizer_config, state_dict, step_dir
 
 

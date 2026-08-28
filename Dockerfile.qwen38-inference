@@ -1,0 +1,17 @@
+FROM vllm/vllm-openai:qwen38-flash-next
+ARG RENDERERS_PRETEND_VERSION=0.1.10
+WORKDIR /opt/prime
+COPY deps/renderers deps/renderers
+COPY packages/prime-rl-configs packages/prime-rl-configs
+COPY pyproject.toml README.md ./
+COPY src src
+RUN sed -i "s/fallback-version = \"0.0.0\"/fallback-version = \"${RENDERERS_PRETEND_VERSION}\"/" deps/renderers/pyproject.toml
+RUN python3 -m pip install --no-cache-dir --no-deps \
+    prime-pydantic-config==0.4.3 \
+    tomli==2.2.1 \
+    tomli-w==1.2.0 && \
+    python3 -m pip install --no-cache-dir --no-deps \
+    ./deps/renderers \
+    ./packages/prime-rl-configs \
+    .
+ENTRYPOINT ["inference"]
