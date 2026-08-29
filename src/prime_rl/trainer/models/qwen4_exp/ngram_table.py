@@ -39,17 +39,17 @@ class PendingNGramLookup:
 
     def result(self) -> Tensor:
         embeddings = self.future.result()
-        if self.inverse is None:
-            return embeddings.view(self.shape)
-        sorted_embeddings = embeddings.new_empty(self.inverse.numel(), self.table.head_dim)
-        dist.all_to_all_single(
-            sorted_embeddings,
-            embeddings,
-            output_split_sizes=self.send_counts,
-            input_split_sizes=self.recv_counts,
-            group=self.table.group,
-        )
-        return sorted_embeddings[self.inverse].view(self.shape)
+        if self.send_counts is not None:
+            gathered = embeddings.new_empty(sum(self.send_counts), self.table.head_dim)
+            dist.all_to_all_single(
+                gathered,
+                embeddings,
+                output_split_sizes=self.send_counts,
+                input_split_sizes=self.recv_counts,
+                group=self.table.group,
+            )
+            embeddings = gathered
+        return embeddings[self.inverse].view(self.shape)
 
 
 class ShardedNGramTable:
@@ -185,30 +185,27 @@ class ShardedNGramTable:
 
     def start(self, ids: Tensor) -> PendingNGramLookup:
         shape = (*ids.shape, self.head_dim)
-        flat_ids = ids.flatten()
+        # unique() returns sorted ids, and shard ownership is monotonic in the id,
+        # so the deduplicated ids are already grouped by owning rank.
+        unique_ids, inverse = ids.flatten().unique(return_inverse=True)
         if self.world_size == 1:
-            return PendingNGramLookup(self._start_local(flat_ids), shape, self)
+            return PendingNGramLookup(self._start_local(unique_ids), shape, self, inverse=inverse)
 
-        shards = torch.div(flat_ids, self.rows_per_shard, rounding_mode="floor")
-        owners = self._owner(shards)
-        order = owners.argsort(stable=True)
-        send_ids = flat_ids[order].contiguous()
-        send_counts = torch.bincount(owners, minlength=self.world_size)
+        shards = torch.div(unique_ids, self.rows_per_shard, rounding_mode="floor")
+        send_counts = torch.bincount(self._owner(shards), minlength=self.world_size)
         recv_counts = torch.empty_like(send_counts)
         dist.all_to_all_single(recv_counts, send_counts, group=self.group)
 
         send_counts_list = send_counts.tolist()
         recv_counts_list = recv_counts.tolist()
-        recv_ids = flat_ids.new_empty(sum(recv_counts_list))
+        recv_ids = unique_ids.new_empty(sum(recv_counts_list))
         dist.all_to_all_single(
             recv_ids,
-            send_ids,
+            unique_ids,
             output_split_sizes=recv_counts_list,
             input_split_sizes=send_counts_list,
             group=self.group,
         )
-        inverse = torch.empty_like(order)
-        inverse[order] = torch.arange(order.numel(), device=order.device)
         return PendingNGramLookup(self._start_local(recv_ids), shape, self, send_counts_list, recv_counts_list, inverse)
 
     def __call__(self, ids: Tensor) -> Tensor:
