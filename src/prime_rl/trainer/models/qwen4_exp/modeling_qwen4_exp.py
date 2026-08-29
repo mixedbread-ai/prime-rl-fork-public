@@ -252,6 +252,12 @@ class Qwen4ExpPreTrainedModel(PreTrainedModelPrimeRL):
                     names.add(f"{prefix}bias")
             if isinstance(module, nn.Linear) and module_name.endswith(("input_mix_weight_down", "input_mix_weight_up")):
                 names.add(f"{prefix}weight")
+            # Report §3.1: the GDN z output gate takes AdamW, and the decay/beta
+            # projections are per-head scalar maps on which orthogonalization is not meaningful.
+            if isinstance(module, nn.Linear) and module_name.endswith(
+                ("linear_attn.in_proj_z", "linear_attn.in_proj_b", "linear_attn.in_proj_a")
+            ):
+                names.add(f"{prefix}weight")
             if isinstance(module, nn.Conv1d):
                 names.add(f"{prefix}weight")
                 if module.bias is not None:

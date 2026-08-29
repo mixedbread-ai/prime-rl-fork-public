@@ -84,6 +84,8 @@ def test_qwen4exp_muon_groups_shard_incompatible_matrices_with_adamw(monkeypatch
     adamw_names = {name for name, (algorithm, _) in assignments.items() if algorithm == "adamw"}
     assert model.muon_adamw_parameter_names() | {"lm_head.weight"} <= adamw_names
     assert all(name in adamw_names for name in assignments if name.endswith("shared_expert_gate.weight"))
+    gdn_gates = {n for n in assignments if n.endswith(("in_proj_z.weight", "in_proj_b.weight", "in_proj_a.weight"))}
+    assert gdn_gates and gdn_gates <= adamw_names
     assert all(assignments[name][0] == "muon" for name in assignments if name.endswith("block_inject_weight.weight"))
     assert all(len({param.dtype for param in group["params"]}) == 1 for group in optimizer.param_groups)
 
