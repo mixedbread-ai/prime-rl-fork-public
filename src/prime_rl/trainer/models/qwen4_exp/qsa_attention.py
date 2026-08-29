@@ -292,7 +292,7 @@ class Qwen4ExpSparseAttention(Qwen3_5MoeGatedAttentionBase):
         self._cp_rank = 0
         self._cp_world_size = 1
 
-    def _attn_projections(
+    def attn_projections(
         self,
         hidden_states: Tensor,
         position_embeddings: tuple[Tensor, Tensor],
@@ -359,7 +359,7 @@ class Qwen4ExpSparseAttention(Qwen3_5MoeGatedAttentionBase):
     ) -> tuple[Tensor, None]:
         cos, sin = position_embeddings
         local = slice(self._cp_rank * hidden_states.shape[1], (self._cp_rank + 1) * hidden_states.shape[1])
-        query, key, value, gate = self._attn_projections(hidden_states, (cos[:, local], sin[:, local]))
+        query, key, value, gate = self.attn_projections(hidden_states, (cos[:, local], sin[:, local]))
 
         if qsa_layout is None:
             return (
