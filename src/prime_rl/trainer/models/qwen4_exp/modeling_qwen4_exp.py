@@ -42,6 +42,8 @@ from .qsa_attention import QsaLayout, Qwen4ExpSparseAttention, build_qsa_layout
 class SplitQKVProjection(nn.Module):
     def __init__(self, hidden_size: int, key_dim: int, value_dim: int):
         super().__init__()
+        self.in_features = hidden_size
+        self.out_features = key_dim * 2 + value_dim
         self.q_proj = nn.Linear(hidden_size, key_dim, bias=False)
         self.k_proj = nn.Linear(hidden_size, key_dim, bias=False)
         self.v_proj = nn.Linear(hidden_size, value_dim, bias=False)
@@ -209,11 +211,12 @@ class Qwen4ExpPreTrainedModel(PreTrainedModelPrimeRL):
     supports_streaming_conversion = True
     default_lora_target_modules = (
         r"(?:^|\.)self_attn\.(q_proj|k_proj|v_proj|o_proj)$",
-        r"(?:^|\.)linear_attn\.(in_proj_z|in_proj_b|in_proj_a|out_proj)$",
+        r"(?:^|\.)linear_attn\.(in_proj_qkv|in_proj_z|in_proj_b|in_proj_a|out_proj)$",
         r"(?:^|\.)ple\.(key_proj|value_proj)$",
         r"(?:^|\.)shared_expert\.(w1|w2|w3)$",
         r"(?:^|\.)mlp\.experts$",
     )
+    lora_linear_module_types = (SplitQKVProjection,)
     lora_grouped_experts_cls = MultiLoRAFusedGateUpGroupedExperts
 
     def _init_weights(self, module: nn.Module) -> None:

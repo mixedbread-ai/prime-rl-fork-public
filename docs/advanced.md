@@ -95,7 +95,7 @@ admin_base_url = ["http://inference-host:8000/v1"]
 
 Filesystem LoRA updates pass the adapter's absolute path to the inference server, so the trainer output directory must be mounted at the same path in the container.
 
-There is no KV cache in the custom trainer path. PrimeRL LoRA uses a Qwen3.8-specific portable target recipe that excludes the frozen QSA indexer and includes the routed experts. The split Gated DeltaNet Q/K/V projections are omitted because released PEFT checkpoints represent them as one fused rank-r adapter.
+There is no KV cache in the custom trainer path. PrimeRL LoRA uses a Qwen3.8-specific portable target recipe that excludes the frozen QSA indexer and includes the routed experts. The split Gated DeltaNet Q/K/V projections train as a single fused rank-r adapter over the concatenated projection, matching the released fused `in_proj_qkv` PEFT layout.
 
 ### Expert Parallelism Backends
 

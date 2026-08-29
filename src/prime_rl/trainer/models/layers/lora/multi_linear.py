@@ -42,7 +42,7 @@ class MultiLoRALinear(MultiLoRAModule):
 
     def __init__(
         self,
-        base_layer: nn.Linear,
+        base_layer: nn.Module,
         rank: int,
         n_adapters: int,
         alpha: float = 32.0,
@@ -66,6 +66,7 @@ class MultiLoRALinear(MultiLoRAModule):
 
         self._lora_num_tokens = get_lora_num_tokens()
         self._scaling_factors = get_multilora_scaling()
+        base_parameter = next(base_layer.parameters())
 
         # LoRA weights: one low-rank pair per adapter
         # [n_adapters, in, r]
@@ -75,8 +76,8 @@ class MultiLoRALinear(MultiLoRAModule):
                     torch.empty(
                         rank,
                         self.in_features,
-                        device=self.base_layer.weight.device,
-                        dtype=self.base_layer.weight.dtype,
+                        device=base_parameter.device,
+                        dtype=base_parameter.dtype,
                     )
                 )
                 for _ in range(n_adapters)
@@ -89,8 +90,8 @@ class MultiLoRALinear(MultiLoRAModule):
                     torch.empty(
                         self.out_features,
                         rank,
-                        device=self.base_layer.weight.device,
-                        dtype=self.base_layer.weight.dtype,
+                        device=base_parameter.device,
+                        dtype=base_parameter.dtype,
                     )
                 )
                 for _ in range(n_adapters)
@@ -130,7 +131,7 @@ class MultiLoRALinear(MultiLoRAModule):
             - adapted_params: Number of base layer parameters being adapted by LoRA
         """
         adapter_params = self.lora_A[0].numel() + self.lora_B[0].numel()
-        adapted_params = self.base_layer.weight.numel()
+        adapted_params = self.in_features * self.out_features
         return adapter_params, adapted_params
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

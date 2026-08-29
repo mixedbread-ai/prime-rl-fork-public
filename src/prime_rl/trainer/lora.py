@@ -145,19 +145,25 @@ def _matches_pattern(name: str, pattern: str) -> bool:
         return pattern in name.split(".")
 
 
+def _linear_module_types(model: nn.Module) -> tuple[type, ...]:
+    """Module types LoRA treats as linear: nn.Linear plus any the model declares."""
+    return (nn.Linear, *getattr(model, "lora_linear_module_types", ()))
+
+
 def _find_target_modules(model: nn.Module, target_patterns: List[str]) -> List[str]:
     """Find all module names that match any of the target patterns.
 
     Patterns can be simple module names (e.g., "q_proj") or regex patterns
     (e.g., r".*\\.q_proj$"). Simple names match any component in the module path.
 
-    Supports both nn.Linear layers and GroupedExperts (MoE) modules.
+    Supports nn.Linear layers, model-declared linear-compatible layers, and GroupedExperts (MoE) modules.
     """
     target_modules = []
+    linear_module_types = _linear_module_types(model)
 
     for name, module in model.named_modules():
         # Check if module is Linear or one of the supported expert classes
-        if not isinstance(module, (nn.Linear, GroupedExperts, NonGatedGroupedExperts, GptOssGroupedExperts)):
+        if not isinstance(module, (*linear_module_types, GroupedExperts, NonGatedGroupedExperts, GptOssGroupedExperts)):
             continue
 
         for pattern in target_patterns:
@@ -245,6 +251,7 @@ def apply_lora_to_model(model: nn.Module, config: LoRAConfig) -> None:
         raise RuntimeError("Cannot apply LoRA to FSDP-wrapped model. Apply LoRA before setup_fsdp().")
 
     target_patterns = _target_patterns(model, config)
+    linear_module_types = _linear_module_types(model)
     logger.debug(f"Applying LoRA to {type(model).__name__} (target_modules={target_patterns})")
     target_modules = _find_target_modules(model, target_patterns)
     logger.debug(
@@ -254,11 +261,16 @@ def apply_lora_to_model(model: nn.Module, config: LoRAConfig) -> None:
     if not target_modules:
         raise ValueError(f"No LoRA target modules found for patterns {target_patterns}.")
 
+    nested = [name for name in target_modules if any(name.startswith(f"{other}.") for other in target_modules)]
+    if nested:
+        logger.warning(f"Skipping LoRA targets nested inside other targets (adapters there would be dead): {nested}")
+        target_modules = [name for name in target_modules if name not in nested]
+
     for module_name in target_modules:
         base_module = _get_module_by_name(model, module_name)
 
         # Handle Linear layers
-        if isinstance(base_module, nn.Linear):
+        if isinstance(base_module, linear_module_types):
             lora_module = MultiLoRALinear(
                 base_layer=base_module,
                 rank=config.rank,
@@ -297,7 +309,7 @@ def apply_lora_to_model(model: nn.Module, config: LoRAConfig) -> None:
         else:
             logger.warning(
                 f"Module {module_name} is type {type(base_module).__name__}, "
-                f"expected nn.Linear, GroupedExperts, NonGatedGroupedExperts, or GptOssGroupedExperts. Skipping."
+                f"expected a linear-compatible or grouped-experts module. Skipping."
             )
             continue
 

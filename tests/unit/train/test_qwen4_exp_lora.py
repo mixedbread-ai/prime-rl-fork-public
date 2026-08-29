@@ -15,17 +15,12 @@ from prime_rl.trainer.lora import (
 from prime_rl.trainer.models.layers.lora import MultiLoRALinear, set_lora_num_tokens
 from prime_rl.trainer.models.layers.lora.multi_moe import MultiLoRAFusedGateUpGroupedExperts
 from prime_rl.trainer.models.layers.moe import GroupedExperts
-from prime_rl.trainer.models.qwen4_exp import Qwen4ExpPreTrainedModel
+from prime_rl.trainer.models.qwen4_exp import Qwen4ExpPreTrainedModel, SplitQKVProjection
 
 
 class _Qwen4ExpTargets(nn.Module):
-    default_lora_target_modules = (
-        r"(?:^|\.)self_attn\.(q_proj|k_proj|v_proj|o_proj)$",
-        r"(?:^|\.)linear_attn\.(in_proj_z|in_proj_b|in_proj_a|out_proj)$",
-        r"(?:^|\.)ple\.(key_proj|value_proj)$",
-        r"(?:^|\.)shared_expert\.(w1|w2|w3)$",
-        r"(?:^|\.)mlp\.experts$",
-    )
+    default_lora_target_modules = Qwen4ExpPreTrainedModel.default_lora_target_modules
+    lora_linear_module_types = Qwen4ExpPreTrainedModel.lora_linear_module_types
     lora_grouped_experts_cls = MultiLoRAFusedGateUpGroupedExperts
 
     def __init__(self):
@@ -42,7 +37,7 @@ class _Qwen4ExpTargets(nn.Module):
         )
         self.linear_attn = nn.ModuleDict(
             {
-                "in_proj_qkv": nn.Linear(8, 24, bias=False),
+                "in_proj_qkv": SplitQKVProjection(hidden_size=8, key_dim=8, value_dim=8),
                 "in_proj_z": nn.Linear(8, 8, bias=False),
                 "in_proj_b": nn.Linear(8, 2, bias=False),
                 "in_proj_a": nn.Linear(8, 2, bias=False),
@@ -72,10 +67,32 @@ def test_qwen4_exp_default_lora_targets_are_architecture_aware():
     targets = _find_target_modules(model, _target_patterns(model, LoRAConfig()))
 
     assert "self_attn.indexer.index_qk_proj" not in targets
-    assert "linear_attn.in_proj_qkv" not in targets
+    assert "linear_attn.in_proj_qkv" in targets
     assert "mlp.experts" in targets
     assert {"shared_expert.w1", "shared_expert.w2", "shared_expert.w3"} <= set(targets)
     assert {"ple.key_proj", "ple.value_proj"} <= set(targets)
+
+
+def test_qwen4_exp_fused_qkv_lora_preserves_rank_and_export_layout():
+    torch.manual_seed(0)
+    config = LoRAConfig(rank=8, alpha=16)
+    state = LoRAState(config, torch.device("cpu"))
+    projection = SplitQKVProjection(hidden_size=64, key_dim=32, value_dim=32)
+    lora = MultiLoRALinear(projection, rank=8, n_adapters=1, alpha=16, use_grouped_mm=False)
+    nn.init.normal_(lora.lora_B[0])
+    set_lora_num_tokens(torch.tensor([4], dtype=torch.int32))
+    hidden_states = torch.randn(4, 64)
+
+    output = lora(hidden_states)
+    base_weight = torch.cat((projection.q_proj.weight, projection.k_proj.weight, projection.v_proj.weight))
+    merged_weight = base_weight + (config.alpha / config.rank) * lora.lora_B[0] @ lora.lora_A[0]
+    torch.testing.assert_close(output, nn.functional.linear(hidden_states, merged_weight))
+
+    state.register_module("model.layers.0.linear_attn.in_proj_qkv", lora)
+    state.register_adapter_state_dict_converter(Qwen4ExpPreTrainedModel.convert_adapter_to_hf)
+    adapter = state.adapter_state_dict()
+    assert adapter["base_model.model.model.layers.0.linear_attn.in_proj_qkv.lora_A.weight"].shape == (8, 64)
+    assert adapter["base_model.model.model.layers.0.linear_attn.in_proj_qkv.lora_B.weight"].shape == (96, 8)
 
 
 def test_qwen4_exp_expert_lora_has_gradients_and_native_state(tmp_path):

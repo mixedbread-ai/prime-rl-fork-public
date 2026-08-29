@@ -7,6 +7,7 @@ from prime_rl.trainer.models.qwen4_exp.modeling_qwen4_exp import (
     Qwen4ExpForCausalLM,
     Qwen4ExpModel,
     Qwen4ExpPreTrainedModel,
+    SplitQKVProjection,
 )
 
 __all__ = [
@@ -16,4 +17,5 @@ __all__ = [
     "Qwen4ExpPreTrainedModel",
     "Qwen4ExpVisionConfig",
     "Qwen4ExpVLMConfig",
+    "SplitQKVProjection",
 ]
