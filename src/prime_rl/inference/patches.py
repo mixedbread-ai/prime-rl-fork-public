@@ -1,3 +1,5 @@
+import importlib
+
 import torch
 
 
@@ -313,20 +315,20 @@ def _patch_qwen35_moe_lora_format():
 
 
 def _patch_qwen4_exp_moe_lora_format():
-    try:
-        from vllm.models.qwen3_8_flash_next import (
-            Qwen3_8FlashNextForCausalLM as Qwen4ExpForCausalLM,
-        )
-        from vllm.models.qwen3_8_flash_next import (
-            Qwen3_8FlashNextForConditionalGeneration as Qwen4ExpForConditionalGeneration,
-        )
-    except ModuleNotFoundError as error:
-        if error.name in {"vllm.models", "vllm.models.qwen3_8_flash_next"}:
-            return
-        raise
-
-    Qwen4ExpForCausalLM.is_3d_moe_weight = True
-    Qwen4ExpForConditionalGeneration.is_3d_moe_weight = True
+    modules = {
+        "vllm.models.qwen3_8_flash_next": ("Qwen3_8FlashNextForCausalLM", "Qwen3_8FlashNextForConditionalGeneration"),
+        "vllm.models.qwen4_exp": ("Qwen4ExpForCausalLM", "Qwen4ExpForConditionalGeneration"),
+    }
+    for module_name, class_names in modules.items():
+        try:
+            module = importlib.import_module(module_name)
+            # The class lookup runs the package's platform dispatcher, which fails on
+            # hardware that cannot serve the model; the patch is moot there.
+            classes = [getattr(module, class_name) for class_name in class_names]
+        except (ImportError, NotImplementedError):
+            continue
+        for cls in classes:
+            cls.is_3d_moe_weight = True
 
 
 def _patch_lora_key_prefix():
