@@ -145,19 +145,25 @@ def _matches_pattern(name: str, pattern: str) -> bool:
         return pattern in name.split(".")
 
 
+def _linear_module_types(model: nn.Module) -> tuple[type, ...]:
+    """Module types LoRA treats as linear: nn.Linear plus any the model declares."""
+    return (nn.Linear, *getattr(model, "lora_linear_module_types", ()))
+
+
 def _find_target_modules(model: nn.Module, target_patterns: List[str]) -> List[str]:
     """Find all module names that match any of the target patterns.
 
     Patterns can be simple module names (e.g., "q_proj") or regex patterns
     (e.g., r".*\\.q_proj$"). Simple names match any component in the module path.
 
-    Supports both nn.Linear layers and GroupedExperts (MoE) modules.
+    Supports nn.Linear layers, model-declared linear-compatible layers, and GroupedExperts (MoE) modules.
     """
     target_modules = []
+    linear_module_types = _linear_module_types(model)
 
     for name, module in model.named_modules():
         # Check if module is Linear or one of the supported expert classes
-        if not isinstance(module, (nn.Linear, GroupedExperts, NonGatedGroupedExperts, GptOssGroupedExperts)):
+        if not isinstance(module, (*linear_module_types, GroupedExperts, NonGatedGroupedExperts, GptOssGroupedExperts)):
             continue
 
         for pattern in target_patterns:
@@ -166,6 +172,17 @@ def _find_target_modules(model: nn.Module, target_patterns: List[str]) -> List[s
                 break
 
     return target_modules
+
+
+def _target_patterns(model: nn.Module, config: LoRAConfig) -> list[str]:
+    if "target_modules" not in config.model_fields_set:
+        return list(getattr(model, "default_lora_target_modules", config.target_modules))
+    return config.target_modules
+
+
+def _adapter_target_module(model: nn.Module, name: str) -> str:
+    get_target = getattr(model, "lora_adapter_target_module", None)
+    return get_target(name) if callable(get_target) else name.rsplit(".", 1)[-1]
 
 
 def _should_keep_trainable(param_name: str, modules_to_save_patterns: List[str]) -> bool:
@@ -233,20 +250,27 @@ def apply_lora_to_model(model: nn.Module, config: LoRAConfig) -> None:
         )
         raise RuntimeError("Cannot apply LoRA to FSDP-wrapped model. Apply LoRA before setup_fsdp().")
 
-    logger.debug(f"Applying LoRA to {type(model).__name__} (target_modules={config.target_modules})")
-    target_modules = _find_target_modules(model, config.target_modules)
+    target_patterns = _target_patterns(model, config)
+    linear_module_types = _linear_module_types(model)
+    logger.debug(f"Applying LoRA to {type(model).__name__} (target_modules={target_patterns})")
+    target_modules = _find_target_modules(model, target_patterns)
     logger.debug(
         f"Found {len(target_modules)} target modules for LoRA: {target_modules[:10]} ... {target_modules[-10:]}"
     )
 
     if not target_modules:
-        raise ValueError(f"No LoRA target modules found for patterns {config.target_modules}.")
+        raise ValueError(f"No LoRA target modules found for patterns {target_patterns}.")
+
+    nested = [name for name in target_modules if any(name.startswith(f"{other}.") for other in target_modules)]
+    if nested:
+        logger.warning(f"Skipping LoRA targets nested inside other targets (adapters there would be dead): {nested}")
+        target_modules = [name for name in target_modules if name not in nested]
 
     for module_name in target_modules:
         base_module = _get_module_by_name(model, module_name)
 
         # Handle Linear layers
-        if isinstance(base_module, nn.Linear):
+        if isinstance(base_module, linear_module_types):
             lora_module = MultiLoRALinear(
                 base_layer=base_module,
                 rank=config.rank,
@@ -256,7 +280,8 @@ def apply_lora_to_model(model: nn.Module, config: LoRAConfig) -> None:
             )
         # Handle GroupedExperts (MoE)
         elif isinstance(base_module, GroupedExperts):
-            lora_module = MultiLoRAGroupedExperts(
+            lora_cls = getattr(model, "lora_grouped_experts_cls", MultiLoRAGroupedExperts)
+            lora_module = lora_cls(
                 base_layer=base_module,
                 rank=config.rank,
                 n_adapters=1,
@@ -284,7 +309,7 @@ def apply_lora_to_model(model: nn.Module, config: LoRAConfig) -> None:
         else:
             logger.warning(
                 f"Module {module_name} is type {type(base_module).__name__}, "
-                f"expected nn.Linear, GroupedExperts, NonGatedGroupedExperts, or GptOssGroupedExperts. Skipping."
+                f"expected a linear-compatible or grouped-experts module. Skipping."
             )
             continue
 
@@ -338,12 +363,15 @@ def save_lora_config(model: nn.Module, save_path, rank: int, alpha: float, dropo
 
     # Extract actual target modules from the model
     target_modules = set()
+    target_parameters = set()
     modules_to_save = set()
 
     for name, module in model.named_modules():
         if isinstance(module, MultiLoRAModule):
-            module_suffix = name.split(".")[-1]
-            target_modules.add(module_suffix)
+            if hasattr(module, "target_parameters"):
+                target_parameters.update(module.target_parameters)
+            else:
+                target_modules.add(_adapter_target_module(model, name))
 
     for name, param in model.named_parameters():
         if param.requires_grad and "lora_A" not in name and "lora_B" not in name:
@@ -361,6 +389,8 @@ def save_lora_config(model: nn.Module, save_path, rank: int, alpha: float, dropo
         "target_modules": sorted(list(target_modules)),
         "modules_to_save": sorted(list(modules_to_save)) if modules_to_save else None,
     }
+    if target_parameters:
+        adapter_config["target_parameters"] = sorted(target_parameters)
 
     config_path = save_path / "adapter_config.json"
     with open(config_path, "w") as f:

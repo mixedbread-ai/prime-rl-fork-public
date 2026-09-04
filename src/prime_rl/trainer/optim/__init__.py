@@ -53,6 +53,7 @@ def setup_optimizer(
         config,
         optimizer_named_params,
         parallel_dims,
+        muon_adamw_parameter_names=_model_muon_adamw_parameter_names(model) if config.type == "muon" else None,
         fused_adamw=config.type == "adamw" and not cpu_offload,
     )
 
@@ -79,6 +80,7 @@ def _create_optimizer(
     named_params: list[tuple[str, nn.Parameter]],
     parallel_dims: ParallelDims,
     lr: float | None = None,
+    muon_adamw_parameter_names: set[str] | None = None,
     fused_adamw: bool = False,
 ) -> Optimizer:
     """Create optimizer. If lr is None, uses config.lr."""
@@ -107,7 +109,13 @@ def _create_optimizer(
                 fused=fused_adamw,
             )
         case "muon":
-            return _create_muon_optimizer(config, named_params, parallel_dims, lr)
+            return _create_muon_optimizer(
+                config,
+                named_params,
+                parallel_dims,
+                lr,
+                adamw_parameter_names=muon_adamw_parameter_names,
+            )
         case "sign_sgd":
             return SignSGD(
                 params=trainable_params,
@@ -116,11 +124,17 @@ def _create_optimizer(
             )
 
 
+def _model_muon_adamw_parameter_names(model: nn.Module | None) -> set[str]:
+    get_names = getattr(model, "muon_adamw_parameter_names", None)
+    return get_names() if callable(get_names) else set()
+
+
 def _create_muon_optimizer(
     config: OptimizerConfig,
     named_params: list[tuple[str, nn.Parameter]],
     parallel_dims: ParallelDims,
     lr: float | None = None,
+    adamw_parameter_names: set[str] | None = None,
 ) -> Optimizer:
     def muon_enabled(n, p):
         if p.ndim < 2:
@@ -131,12 +145,19 @@ def _create_muon_optimizer(
             return False
         return True
 
+    adamw_parameter_names = adamw_parameter_names or set()
     muon_params = []
     expert_params = []
     router_params = []
-    adamw_params = []
+    adamw_params: dict[torch.dtype, list[nn.Parameter]] = {}
+
+    def add_adamw_param(param: nn.Parameter) -> None:
+        adamw_params.setdefault(param.dtype, []).append(param)
+
     for n, p in named_params:
-        if p.requires_grad and muon_enabled(n, p):
+        if n in adamw_parameter_names and p.requires_grad:
+            add_adamw_param(p)
+        elif p.requires_grad and muon_enabled(n, p):
             if "mlp.experts" in n:
                 expert_params.append(p)
             elif "mlp.router" in n:
@@ -144,12 +165,11 @@ def _create_muon_optimizer(
             else:
                 muon_params.append(p)
         elif p.requires_grad:
-            adamw_params.append(p)
+            add_adamw_param(p)
         else:
             pass
 
     param_groups = []
-
     param_groups.append(
         dict(params=muon_params, algorithm="muon", lr=lr, weight_decay=config.weight_decay, adjust_lr="rms_norm")
     )
@@ -177,8 +197,8 @@ def _create_muon_optimizer(
                 adjust_lr="rms_norm",
             )
         )
-
-    param_groups.append(dict(params=adamw_params, algorithm="adamw", lr=lr, weight_decay=config.weight_decay))
+    for params in adamw_params.values():
+        param_groups.append(dict(params=params, algorithm="adamw", lr=lr, weight_decay=config.weight_decay))
 
     if parallel_dims.dp_shard_enabled or parallel_dims.cp_enabled:
         distributed_mesh = parallel_dims.get_mesh("dp_shard_cp")

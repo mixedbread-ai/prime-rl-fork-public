@@ -29,8 +29,11 @@ from prime_rl.trainer.models.layers.lm_head import inject_prime_lm_head
 from prime_rl.trainer.models.minimax_m2 import MiniMaxM2Config
 from prime_rl.trainer.models.minimax_m2 import MiniMaxM2ForCausalLM as PrimeRLMiniMaxM2ForCausalLM
 from prime_rl.trainer.models.qwen3_5_moe import Qwen3_5MoeForCausalLM as PrimeRLQwen3_5MoeVLM
+from prime_rl.trainer.models.qwen4_exp import Qwen4ExpConfig
+from prime_rl.trainer.models.qwen4_exp import Qwen4ExpForCausalLM as PrimeRLQwen4ExpForCausalLM
 from prime_rl.utils.logger import setup_logger
 from prime_rl.utils.utils import default_dtype
+from prime_rl.utils.weights import load_state_dict
 
 setup_logger("info")
 
@@ -72,6 +75,39 @@ def _qwen3_5_moe_vlm_config():
     config.video_token_id = 251
     config.vision_start_token_id = 252
     config.vision_end_token_id = 253
+    return config
+
+
+def _qwen4_exp_config():
+    config = Qwen4ExpConfig(
+        vocab_size=248320,
+        hidden_size=256,
+        num_hidden_layers=8,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=64,
+        max_position_embeddings=512,
+        hc_count=4,
+        hc_lowrank=64,
+        linear_num_key_heads=2,
+        linear_num_value_heads=4,
+        linear_key_head_dim=32,
+        linear_value_head_dim=32,
+        ple_layer_ids=[2],
+        ngram_vocab_size_base=101,
+        indexer_n_heads=4,
+        indexer_kv_heads=1,
+        indexer_head_dim=32,
+        indexer_budget=16,
+        indexer_compress_ratio=4,
+        moe_intermediate_size=128,
+        shared_expert_intermediate_size=128,
+        num_experts=4,
+        num_experts_per_tok=2,
+        eos_token_id=[2],
+        use_grouped_mm=False,
+    )
+    config.use_cache = False
     return config
 
 
@@ -194,6 +230,12 @@ ARCH_PRESETS = {
         "tokenizer_source": "Qwen/Qwen3.5-35B-A3B",
         "is_vlm": True,
     },
+    "qwen4_exp": {
+        "config_fn": _qwen4_exp_config,
+        "prime_model_class": PrimeRLQwen4ExpForCausalLM,
+        "tokenizer_source": "Qwen/Qwen3.8-Flash-Next",
+        "prime_only": True,
+    },
     # glm_moe_dsa: HF implementation is incorrect, not supported here
 }
 
@@ -238,7 +280,10 @@ def create(arch: str, output_dir: Path) -> None:
     print(f"  hidden_size={text_config.hidden_size}, layers={text_config.num_hidden_layers}")
 
     with torch.device("cpu"):
-        model = _create_hf_model(preset, config)
+        if preset.get("prime_only"):
+            model = preset["prime_model_class"](config)
+        else:
+            model = _create_hf_model(preset, config)
 
     param_count = sum(p.numel() for p in model.parameters())
     print(f"  Parameters: {param_count / 1e6:.1f}M")
@@ -252,8 +297,45 @@ def create(arch: str, output_dir: Path) -> None:
     print(f"  Saved to {output_dir}")
 
 
+def _verify_prime_only(preset, model_dir: Path) -> None:
+    print(f"Verifying PrimeRL save/load, conversion, and packed forward paths for {model_dir}...")
+    config = AutoConfig.from_pretrained(str(model_dir))
+    config._attn_implementation = "flash_attention_3"
+    model = preset["prime_model_class"].from_pretrained(str(model_dir), config=config)
+
+    saved_state_dict = load_state_dict(model_dir)
+    loaded_state_dict = dict(model.state_dict())
+    assert saved_state_dict.keys() == loaded_state_dict.keys(), "Save/load state dict keys do not match"
+    for key, value in saved_state_dict.items():
+        assert torch.equal(value, loaded_state_dict[key]), f"Save/load mismatch at {key}"
+    print("  PrimeRL save/load verified")
+
+    with torch.no_grad():
+        hf_state_dict = model.convert_to_hf(dict(loaded_state_dict))
+        roundtrip_state_dict = model.convert_to_prime(hf_state_dict)
+    assert loaded_state_dict.keys() == roundtrip_state_dict.keys(), "Roundtrip state dict keys do not match"
+    for key, value in loaded_state_dict.items():
+        assert torch.equal(value, roundtrip_state_dict[key]), f"Roundtrip mismatch at {key}"
+    print("  PrimeRL -> HF -> PrimeRL weight roundtrip verified")
+
+    model = model.to(device="cuda", dtype=torch.float32)
+    inject_prime_lm_head(model, chunk_size=None)
+    with torch.device("cuda"), default_dtype(torch.float32), torch.no_grad():
+        input_ids = torch.randint(0, config.vocab_size, (1, 64))
+        position_ids = torch.arange(1, 65).unsqueeze(0)
+        seq_lens = torch.tensor([input_ids.shape[1]])
+        output = model(input_ids, position_ids=position_ids, seq_lens=seq_lens)
+    assert not torch.isnan(output["logits"]).any(), "PrimeRL output contains NaN"
+    print("  Packed forward verified")
+    print("  Verification passed.")
+
+
 def verify(arch: str, model_dir: Path) -> None:
     preset = ARCH_PRESETS[arch]
+    if preset.get("prime_only"):
+        _verify_prime_only(preset, model_dir)
+        return
+
     is_vlm = preset.get("is_vlm", False)
     print(f"Verifying HF <-> PrimeRL roundtrip for {model_dir}...")
 

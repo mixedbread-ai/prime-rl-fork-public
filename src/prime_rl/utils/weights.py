@@ -1,6 +1,9 @@
 import json
+import os
 import re
+import tempfile
 import warnings
+from collections.abc import Callable
 from pathlib import Path
 from typing import cast
 
@@ -32,15 +35,58 @@ def load_state_dict_keys(save_dir: Path) -> list[str]:
     return keys
 
 
-def load_state_dict(save_dir: Path) -> dict[str, Tensor]:
+def load_state_dict(save_dir: Path, exclude_prefixes: tuple[str, ...] = ()) -> dict[str, Tensor]:
     """Load a state dict from a local directory with safetensor files."""
     safetensors_paths = list(save_dir.glob("*.safetensors"))
     state_dict = {}
     for safetensor_path in safetensors_paths:
         with safe_open(safetensor_path, framework="pt", device="cpu") as f:
             for key in f.keys():
+                if key.startswith(exclude_prefixes):
+                    continue
                 state_dict[key] = f.get_tensor(key)
     return state_dict
+
+
+def convert_state_dict_streaming(
+    source_dir: Path,
+    output_dir: Path,
+    converter: Callable[[dict[str, Tensor]], dict[str, Tensor]],
+    exclude_prefixes: tuple[str, ...] = (),
+) -> None:
+    """Convert independent safetensors shards and publish the output atomically."""
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=output_dir.parent) as temp_dir:
+        converted_dir = Path(temp_dir) / output_dir.name
+        converted_dir.mkdir()
+        weight_map = {}
+        external_weight_map = {}
+        total_size = 0
+        for source_path in sorted(source_dir.glob("*.safetensors")):
+            with safe_open(source_path, framework="pt", device="cpu") as reader:
+                state_dict = {}
+                for key in reader.keys():
+                    if key.startswith(exclude_prefixes):
+                        external_weight_map[key] = source_path.name
+                    else:
+                        state_dict[key] = reader.get_tensor(key)
+            state_dict = converter(state_dict)
+            if not state_dict:
+                continue
+            state_dict = {key: value.contiguous() for key, value in state_dict.items()}
+            save_file(state_dict, converted_dir / source_path.name, metadata={"format": "pt"})
+            for key, value in state_dict.items():
+                weight_map[key] = source_path.name
+                total_size += value.numel() * value.element_size()
+        index = {"metadata": {"total_size": total_size}, "weight_map": weight_map}
+        (converted_dir / SAFE_WEIGHTS_INDEX_NAME).write_text(json.dumps(index, indent=2, sort_keys=True) + "\n")
+        if external_weight_map:
+            manifest = {
+                "source": os.path.relpath(source_dir.resolve(), output_dir.resolve()),
+                "weight_map": external_weight_map,
+            }
+            (converted_dir / "external_weights.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+        converted_dir.rename(output_dir)
 
 
 def save_state_dict(

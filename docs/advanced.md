@@ -28,6 +28,7 @@ impl = "custom"        # or "hf" to force the HF path
 | Qwen3 MoE | `Qwen/Qwen3-30B-A3B`, … | ✅ | ✅ |
 | Qwen3.5 MoE | `Qwen/Qwen3.5-35B-A3B`, … | ✅ | ✅ |
 | Qwen3 / Qwen3.5 VLMs | see [Multimodal training](#multimodal-training) | MoE only | ❌ |
+| Qwen3.8-Flash-Next | `Qwen/Qwen3.8-Flash-Next`, see [Qwen3.8-Flash-Next](#qwen38-flash-next) | ✅ | ✅ |
 | Laguna | `poolside/Laguna-XS.2` | ✅ | ✅ |
 | MiniMax M2 | `MiniMax/MiniMax-M2` | ✅ | ✅ |
 | Nemotron H | `nvidia/Nemotron-3-Nano-30B-A3B`, … | ✅ | ❌ |
@@ -53,6 +54,49 @@ enable_a2a = true
 
 GLM-5.2 adds IndexShare: the DSA sparse-attention indexer runs only on a subset of layers and the remaining layers reuse the cached top-k indices. The trainer reads this schedule from the model's `indexer_types` config field and enables the index cache automatically, so no extra config is needed. To override the schedule manually, set `[trainer.model.index_cache]` (`topk_freq` or `topk_pattern`).
 
+### Qwen3.8-Flash-Next
+
+`Qwen/Qwen3.8-Flash-Next` (`qwen4_exp`) is a ~180B composite VLM — `model_type = "qwen4_exp"` over a `qwen4_exp_text` text config — reusing the Qwen3.5-MoE SigLIP-style vision tower from transformers. Its 48 decoder layers are hybrid: every fourth layer is softmax attention (12 of 48), the rest are Gated DeltaNet linear attention. Every layer routes 10 of 512 experts and adds a gated shared expert. Hyper-connections widen the residual stream into `hc_count = 4` streams read through a low-rank mixer; the per-layer input and post-attention norms and the terminal `hyper_connection_mixer` are all part of that mechanism.
+
+The 12 softmax layers run Qwen Sparse Attention (QSA): a multi-query indexer keeps the top-k compressed key blocks per query. prime-rl runs it through `torch.nn.attention.flex_attention` with exact QSA semantics, but on a 128-token block mask rather than QSA's native 4-token granularity. The indexer streams over query and compressed-key chunks while retaining only the current top-k, so its score workspace does not grow with the full query-by-key product. Sparse layers fall back to dense flash-attention varlen only when context parallelism is off and the batch's longest document is at most `dense_equivalent_seqlen`, the length below which every query keeps every visible block anyway. Equal indexer scores resolve to the earlier block within a document, making selection invariant to neighbouring packed documents. The indexer selects with a non-differentiable top-k and receives no gradient. The multi-token-prediction head in the checkpoint (`mtp.*`) is not implemented and is dropped on conversion.
+
+One decoder layer carries hashed bigram/trigram embeddings (PLE), held as 128 checkpoint shards totalling 51.2B frozen parameters. During PrimeRL setup the table is removed from module state and divided across the `dp_shard_cp` mesh as read-only CPU-resident shards. Each forward routes hash IDs to the owning ranks and returns only the selected embeddings to the accelerator. The table is absent from FSDP, optimizers, trainer checkpoints and weight broadcasts. Resume and offline export rebind it from the resolved `trainer.model.name` in the run config, so the base snapshot must remain available and `model.name` must resolve to the same snapshot for the run's lifetime.
+
+The bundled Qwen3.8 renderer produces image sidecars for training.
+
+The shared Prime environment keeps its standard vLLM dependency. For Qwen3.8 day-one inference, build the dedicated image on top of the Qwen-capable vLLM runtime:
+
+```bash
+docker build -f Dockerfile.qwen38-inference -t prime-rl-qwen38-inference .
+docker run --gpus all --ipc=host --network=host \
+  -v /path/to/Qwen3.8-Flash-Next:/model:ro \
+  -v /shared/prime-runs:/shared/prime-runs \
+  prime-rl-qwen38-inference \
+  --router None \
+  --vllm.model /model \
+  --vllm.tensor-parallel-size 8 \
+  --vllm.enable-expert-parallel true \
+  --vllm.enable-lora true \
+  --vllm.lora-target-modules '["experts"]'
+```
+
+Run RL against that external server without an `[inference]` block:
+
+```toml
+output_dir = "/shared/prime-runs"
+
+[deployment]
+num_infer_gpus = 0
+
+[orchestrator.model.client]
+base_url = "http://inference-host:8000/v1"
+admin_base_url = ["http://inference-host:8000/v1"]
+```
+
+Filesystem LoRA updates pass the adapter's absolute path to the inference server, so the trainer output directory must be mounted at the same path in the container.
+
+There is no KV cache in the custom trainer path. PrimeRL LoRA uses a Qwen3.8-specific portable target recipe that excludes the frozen QSA indexer and includes the routed experts. The split Gated DeltaNet Q/K/V projections train as a single fused rank-r adapter over the concatenated projection, matching the released fused `in_proj_qkv` PEFT layout.
+
 ### Expert Parallelism Backends
 
 `model.ep_comm_backend` picks the all-to-all kernel used for EP dispatch/combine:
@@ -73,6 +117,7 @@ The built-in VLM registry covers:
 |---|---|---|---|
 | Qwen3.5 | `qwen3_5` | `model.visual` | `model.language_model` |
 | Qwen3.5-MoE | `qwen3_5_moe` | `model.visual` | `model.language_model` |
+| Qwen3.8-Flash-Next | `qwen4_exp` | `model.visual` | `model.language_model` |
 
 ### Enabling VLM Mode
 

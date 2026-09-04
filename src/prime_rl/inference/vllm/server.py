@@ -6,8 +6,6 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from starlette.datastructures import State
 from vllm.engine.protocol import EngineClient
-from vllm.entrypoints.openai.api_server import init_app_state
-from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
 from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.serve.lora.protocol import LoadLoRAAdapterRequest
@@ -15,6 +13,7 @@ from vllm.logger import init_logger
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from prime_rl.configs.inference import InferenceConfig
+from prime_rl.inference.vllm.server_api import install_server_overrides, load_vllm_server_api
 from prime_rl.utils.logger import get_logger
 
 logger = get_logger()
@@ -47,6 +46,7 @@ monkey_patch_strip_routed_experts_from_chat()
 monkey_patch_dp_coordinator_startup_timeout()
 
 logger = init_logger("vllm.entrypoints.openai.api_server")
+server_api = load_vllm_server_api()
 
 # Create our own router for custom endpoints
 router = APIRouter()
@@ -165,7 +165,7 @@ async def custom_init_app_state(
        routing and ``routed_experts`` export survive the migration off the
        legacy ``/v1/generate`` endpoint.
     """
-    await init_app_state(engine_client, state, args, supported_tasks)
+    await server_api.init_app_state(engine_client, state, args, supported_tasks)
 
     state.liveness_timeout_seconds = args.liveness_timeout_seconds
 
@@ -181,9 +181,7 @@ async def custom_init_app_state(
         state.serving_tokens = prime_serving
 
 
-import vllm.entrypoints.openai.api_server
 import vllm.v1.utils
-from vllm.entrypoints.openai.api_server import build_app as _original_build_app
 from vllm.v1.utils import run_api_server_worker_proc as _original_run_api_server_worker_proc
 
 
@@ -191,7 +189,7 @@ def custom_build_app(args: Namespace, supported_tasks: tuple, model_config=None)
     """
     Wrap build_app to include our custom router.
     """
-    app = _original_build_app(args, supported_tasks, model_config)
+    app = server_api.build_app(args, supported_tasks, model_config)
     app.include_router(router)
     return app
 
@@ -206,8 +204,7 @@ def custom_run_api_server_worker_proc(listen_address, sock, args, client_config=
     _original_run_api_server_worker_proc(listen_address, sock, args, client_config, **uvicorn_kwargs)
 
 
-vllm.entrypoints.openai.api_server.init_app_state = custom_init_app_state
-vllm.entrypoints.openai.api_server.build_app = custom_build_app
+install_server_overrides(server_api, custom_init_app_state, custom_build_app)
 vllm.v1.utils.run_api_server_worker_proc = custom_run_api_server_worker_proc
 
 
@@ -218,7 +215,6 @@ def server(config: InferenceConfig):
     import os
 
     from vllm.entrypoints.cli.serve import run_headless, run_multi_api_server
-    from vllm.entrypoints.openai.api_server import run_server
 
     # Signal worker processes to disable LoRA on MoE layers when LoRA targets don't include experts
     lora_target_modules = config.vllm.lora_target_modules
@@ -228,10 +224,10 @@ def server(config: InferenceConfig):
     namespace = config.to_namespace()
 
     parser = FlexibleArgumentParser(description="vLLM OpenAI-Compatible RESTful API server.")
-    parser = make_arg_parser(parser)
+    parser = server_api.make_arg_parser(parser)
     args = parser.parse_args(args=[], namespace=namespace)
     assert args is not None
-    validate_parsed_serve_args(args)
+    server_api.validate_parsed_serve_args(args)
 
     # Set the worker extension class based on the broadcast backend
     args.worker_extension_cls = WORKER_EXTENSION_CLS[config.weight_broadcast.type]
@@ -243,4 +239,4 @@ def server(config: InferenceConfig):
             run_multi_api_server(args)
         else:
             # Single API server (this process).
-            uvloop.run(run_server(args))
+            uvloop.run(server_api.entry.run_server(args))

@@ -24,6 +24,12 @@ from prime_rl.trainer.models.qwen3 import Qwen3ForCausalLM
 from prime_rl.trainer.models.qwen3_5 import Qwen3_5ForCausalLM
 from prime_rl.trainer.models.qwen3_5_moe import Qwen3_5MoeConfig, Qwen3_5MoeForCausalLM
 from prime_rl.trainer.models.qwen3_moe import Qwen3MoeConfig, Qwen3MoeForCausalLM
+from prime_rl.trainer.models.qwen4_exp import (
+    Qwen4ExpConfig,
+    Qwen4ExpForCausalLM,
+    Qwen4ExpVisionConfig,
+    Qwen4ExpVLMConfig,
+)
 
 # Make custom config discoverable by AutoConfig
 AutoConfig.register("afmoe", AfmoeConfig, exist_ok=True)
@@ -35,6 +41,9 @@ AutoConfig.register("nemotron_h", NemotronHConfig, exist_ok=True)
 AutoConfig.register("qwen3_moe", Qwen3MoeConfig, exist_ok=True)
 AutoConfig.register("qwen3_5_text", Qwen3_5TextConfig, exist_ok=True)
 AutoConfig.register("qwen3_5_moe_text", Qwen3_5MoeConfig, exist_ok=True)
+AutoConfig.register("qwen4_exp_text", Qwen4ExpConfig, exist_ok=True)
+AutoConfig.register("qwen4_exp_vision", Qwen4ExpVisionConfig, exist_ok=True)
+AutoConfig.register("qwen4_exp", Qwen4ExpVLMConfig, exist_ok=True)
 # GptOssConfig is just HF's class - already registered by transformers, no override needed.
 
 _CUSTOM_CAUSAL_LM_MAPPING = _LazyAutoMapping(CONFIG_MAPPING_NAMES, OrderedDict())
@@ -53,6 +62,7 @@ _CUSTOM_CAUSAL_LM_MODELS: tuple[
     (Qwen3MoeConfig, Qwen3MoeForCausalLM),
     (Qwen3_5TextConfig, Qwen3_5ForCausalLM),
     (Qwen3_5MoeConfig, Qwen3_5MoeForCausalLM),
+    (Qwen4ExpConfig, Qwen4ExpForCausalLM),
     (GptOssConfig, GptOssForCausalLM),
 )
 for config_cls, model_cls in _CUSTOM_CAUSAL_LM_MODELS:
@@ -93,6 +103,7 @@ def supports_custom_impl(model_config: PretrainedConfig) -> bool:
 _CUSTOM_VLM_MAPPING: dict[str, type] = {
     "qwen3_5": Qwen3_5ForCausalLM,
     "qwen3_5_moe": Qwen3_5MoeForCausalLM,
+    "qwen4_exp": Qwen4ExpForCausalLM,
 }
 
 

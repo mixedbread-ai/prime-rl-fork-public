@@ -45,6 +45,7 @@ from prime_rl.trainer.models import (
     get_custom_vlm_cls,
     supports_custom_impl,
 )
+from prime_rl.trainer.models.base import ExternalWeightsModel
 from prime_rl.trainer.models.glm_moe_dsa.sparse_mla_attention import Indexer
 from prime_rl.trainer.models.layers.checkpointing import (
     get_supported_targets,
@@ -63,6 +64,7 @@ from prime_rl.utils.sequence import get_cu_seqlens_from_position_ids
 from prime_rl.utils.utils import format_time
 from prime_rl.utils.vlm import get_language_model, get_vision_encoder, is_vlm_architecture
 from prime_rl.utils.weights import (
+    convert_state_dict_streaming,
     load_state_dict,
     load_state_dict_keys,
     save_state_dict,
@@ -541,7 +543,8 @@ def apply_force_balanced_routing(model: nn.Module) -> None:
 
 
 def is_tt_moe_model(model: nn.Module) -> bool:
-    return hasattr(model.config, "num_experts") or hasattr(model.config, "n_routed_experts")
+    text_config = model.config.get_text_config()
+    return hasattr(text_config, "num_experts") or hasattr(text_config, "n_routed_experts")
 
 
 def configure_moe_ep_backend(model: nn.Module, config: ModelConfig) -> None:
@@ -647,12 +650,13 @@ def get_model(
         subconfig = getattr(model_config, subconfig_key, None)
         if subconfig is not None and hasattr(subconfig, "use_cache"):
             subconfig.use_cache = False
-    model_config.use_grouped_mm = config.moe_use_grouped_mm
     # MoEArgs.fp8 (read via getattr(config, "fp8") in the modeling files) gates the
     # DeepGEMM FP8 grouped GEMM. MXFP8 grouped GEMM is applied by wrapping the expert
     # weights with torchao (see apply_quantization), so it leaves this flag False and
     # the experts keep calling torch._grouped_mm — which the wrapper tensor intercepts.
-    model_config.fp8 = isinstance(config.quantization, FP8Config) and config.quantization.enable_grouped_gemm
+    for moe_config in (model_config, model_config.get_text_config()):
+        moe_config.use_grouped_mm = config.moe_use_grouped_mm
+        moe_config.fp8 = isinstance(config.quantization, FP8Config) and config.quantization.enable_grouped_gemm
 
     if config.index_cache is not None:
         model_config.use_index_cache = True
@@ -960,6 +964,20 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
                 transformer_block.set_modules_to_backward_prefetch([embed_module])
 
 
+def _resolve_model_snapshot(config: ModelConfig) -> Path:
+    if not Path(config.name).exists():
+        return Path(snapshot_download(repo_id=config.name, repo_type="model"))
+    get_logger().info(
+        f"Loading model weights from path {config.name}, skipping snapshot download. If this is not expected, please remove the directory {config.name} and run again"
+    )
+    return Path(config.name)
+
+
+def _bind_external_weights(model: ExternalWeightsModel, config: ModelConfig, parallel_dims: ParallelDims) -> None:
+    snapshot_path = None if config.debug.random_init else _resolve_model_snapshot(config)
+    model.bind_external_weights(snapshot_path, parallel_dims.get_mesh("dp_shard_cp"))
+
+
 def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims):
     device = "cpu" if config.fsdp_cpu_offload else "cuda"
     model.to_empty(device=device)
@@ -973,17 +991,16 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
 
     logger = get_logger()
     if config.debug.random_init:
+        if isinstance(model, ExternalWeightsModel):
+            _bind_external_weights(model, config, parallel_dims)
         logger.warning("Randomly initializing model. Skipping loading weights from HF.")
         _move_buffers_to_cuda(model, config)
         return
 
-    if not Path(config.name).exists():
-        snapshot_path = Path(snapshot_download(repo_id=config.name, repo_type="model"))
-    else:
-        logger.info(
-            f"Loading model weights from path {config.name}, skipping snapshot download. If this is not expected, please remove the directory {config.name} and run again"
-        )
-        snapshot_path = Path(config.name)
+    snapshot_path = _resolve_model_snapshot(config)
+
+    if isinstance(model, ExternalWeightsModel):
+        model.bind_external_weights(snapshot_path, parallel_dims.get_mesh("dp_shard_cp"))
 
     # Dynamically convert between different weight formats if needed.
     # All ranks read just the key names (cheap) to determine the path independently.
@@ -1006,10 +1023,19 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
                 logger.debug(
                     f"Converting snapshot state dict to PrimeRL format and saving to {snapshot_path} on master rank. This is a one-time operation."
                 )
-                snapshot_state_dict = load_state_dict(source_path)
-                model.convert_to_prime(snapshot_state_dict)
-                save_state_dict(snapshot_state_dict, snapshot_path)
-                del snapshot_state_dict
+                exclude_prefixes = model.external_weight_prefixes() if isinstance(model, ExternalWeightsModel) else ()
+                if getattr(model, "supports_streaming_conversion", False):
+                    convert_state_dict_streaming(
+                        source_path,
+                        snapshot_path,
+                        model.convert_to_prime,
+                        exclude_prefixes=exclude_prefixes,
+                    )
+                else:
+                    snapshot_state_dict = load_state_dict(source_path, exclude_prefixes=exclude_prefixes)
+                    model.convert_to_prime(snapshot_state_dict)
+                    save_state_dict(snapshot_state_dict, snapshot_path)
+                    del snapshot_state_dict
 
         elif snapshot_is_prime and not snapshot_is_hf and model.is_hf_state_dict(model_keys):
             logger.warning(
@@ -1331,6 +1357,8 @@ def setup_model(
     # 1. We load to meta device by default
     model = get_model(config, device=torch.device("meta"), dtype=DTYPE_MAP[config.optimization_dtype])
     configure_moe_ep_backend(model, config)
+    if isinstance(model, ExternalWeightsModel):
+        model.externalize_weights()
 
     possible_to_load_to_meta = can_reinit_empty_buffers(model)
 
@@ -1344,6 +1372,8 @@ def setup_model(
         logger.warning("Cannot load model to meta device only, loading to CPU instead.")
         model = get_model(config, device=torch.device("cpu"), dtype=DTYPE_MAP[config.optimization_dtype])
         configure_moe_ep_backend(model, config)
+        if isinstance(model, ExternalWeightsModel):
+            model.externalize_weights()
 
     lm_head_chunk_size: int | None = None
     if isinstance(config.fused_lm_head_token_chunk_size, int):
@@ -1420,6 +1450,8 @@ def setup_model(
                     model.tie_weights()
 
             _move_buffers_to_cuda(model, config)
+            if isinstance(model, ExternalWeightsModel):
+                _bind_external_weights(model, config, parallel_dims)
         # - or load from HF with dcp
         else:
             load_dcp_from_hf(model, config, parallel_dims)

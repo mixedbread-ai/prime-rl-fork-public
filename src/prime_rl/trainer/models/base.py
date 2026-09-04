@@ -1,5 +1,20 @@
+from pathlib import Path
+from typing import Protocol, runtime_checkable
+
 from torch import Tensor
+from torch.distributed.device_mesh import DeviceMesh
 from transformers.modeling_utils import PreTrainedModel
+
+
+@runtime_checkable
+class ExternalWeightsModel(Protocol):
+    def externalize_weights(self) -> None: ...
+
+    def external_weight_prefixes(self) -> tuple[str, ...]: ...
+
+    def bind_external_weights(self, snapshot_path: Path | None, mesh: DeviceMesh | None) -> None: ...
+
+    def external_weight_state_dict(self) -> dict[str, Tensor]: ...
 
 
 class PreTrainedModelPrimeRL(PreTrainedModel):
@@ -145,4 +160,4 @@ class PreTrainedModelPrimeRL(PreTrainedModel):
         raise NotImplementedError(f"init_buffers_post_meta is not implemented for {self.__class__.__name__}")
 
 
-__all__ = ["PreTrainedModelPrimeRL"]
+__all__ = ["ExternalWeightsModel", "PreTrainedModelPrimeRL"]
